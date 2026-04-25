@@ -45,3 +45,22 @@ class GReaTTrainer(Trainer):
             pin_memory=self.args.dataloader_pin_memory,
             worker_init_fn=_seed_worker,
         )
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """Inject per-token column ids into DAG attention bias module when enabled."""
+        column_ids = inputs.pop("column_ids", None)
+        dag_bias_module = getattr(model, "dag_attention_bias", None)
+
+        if dag_bias_module is not None:
+            dag_bias_module.set_batch(column_ids)
+
+        try:
+            return super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                **kwargs,
+            )
+        finally:
+            if dag_bias_module is not None:
+                dag_bias_module.clear_batch()
