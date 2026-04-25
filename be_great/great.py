@@ -23,6 +23,7 @@ from be_great.great_start import (
     _pad_tokens,
 )
 from be_great.great_trainer import GReaTTrainer
+from be_great.dag_attention import DAGAttentionBias, attach_dag_bias_to_model
 from be_great.great_constrained import (
     parse_condition,
     enumerate_valid_values,
@@ -150,6 +151,15 @@ class GReaT:
 
         # Per-column statistics for constrained sampling
         self.col_stats = None
+
+        # Optional DAG attention-bias configuration/state
+        self.dag_attention_enabled = False
+        self.dag_edges = None  # serialized as list[[parent, child], ...]
+        self.dag_alpha_init = 0.0
+        self.dag_beta_init = 0.0
+        self.dag_gamma_init = 0.0
+        self.dag_bias_learnable = True
+        self.dag_attention_num_layers = 0
 
     # ------------------------------------------------------------------
     # LoRA helpers
@@ -281,6 +291,57 @@ class GReaT:
             logging.info(f"Model moved to {self.device}")
         return self.device
 
+    def _enable_dag_attention_bias(
+        self,
+        dag_edges: tp.Iterable[tp.Sequence[str]],
+        alpha_init: float = 2.0,
+        beta_init: float = 1.0,
+        gamma_init: float = 1.0,
+        learnable: bool = True,
+    ) -> None:
+        """Enable DAG-based additive attention bias for GPT-2 style attention layers.
+
+        Args:
+            dag_edges: Iterable of directed edges in (parent, child) format.
+            alpha_init: Initial value for learnable scalar alpha (parent bias).
+            beta_init: Initial value for learnable scalar beta (ancestor bias).
+            gamma_init: Initial value for learnable scalar gamma (unrelated penalty).
+            learnable: If True, alpha/beta/gamma are optimized during training.
+                If False, they stay fixed to the provided values.
+        """
+        if self.columns is None:
+            raise ValueError(
+                "Column metadata is not initialized. Call fit() with tabular data before enabling DAG bias."
+            )
+        if dag_edges is None:
+            raise ValueError("dag_edges must be provided to enable DAG attention bias.")
+
+        normalized_edges = [tuple(edge) for edge in dag_edges]
+        dag_bias_module = DAGAttentionBias(
+            columns=self.columns,
+            dag_edges=normalized_edges,
+            alpha_init=alpha_init,
+            beta_init=beta_init,
+            gamma_init=gamma_init,
+            learnable=learnable,
+        )
+        patched_layers = attach_dag_bias_to_model(self.model, dag_bias_module)
+
+        # Keep serializable config on the GReaT object for save/load.
+        self.dag_attention_enabled = True
+        self.dag_edges = [list(edge) for edge in normalized_edges]
+        self.dag_alpha_init = float(alpha_init)
+        self.dag_beta_init = float(beta_init)
+        self.dag_gamma_init = float(gamma_init)
+        self.dag_bias_learnable = bool(learnable)
+        self.dag_attention_num_layers = int(patched_layers)
+
+        logging.info(
+            "Enabled DAG attention bias with %d patched attention layers (learnable=%s).",
+            patched_layers,
+            learnable,
+        )
+
     def fit(
         self,
         data: tp.Union[pd.DataFrame, np.ndarray],
@@ -288,6 +349,11 @@ class GReaT:
         conditional_col: tp.Optional[str] = None,
         resume_from_checkpoint: tp.Union[bool, str] = False,
         random_conditional_col: bool = True,
+        dag_edges: tp.Optional[tp.Iterable[tp.Sequence[str]]] = None,
+        dag_alpha_init: float = 0.0,
+        dag_beta_init: float = 0.0,
+        dag_gamma_init: float = 0.0,
+        dag_bias_learnable: bool = True,
     ) -> GReaTTrainer:
         """Fine-tune GReaT using tabular data.
 
@@ -301,6 +367,12 @@ class GReaT:
             If path, resumes the training from the given checkpoint (has to be a valid HuggingFace checkpoint!)
             random_conditional_col: If True, a different random column will be selected for preconditioning
             in each epoch. This helps prevent any single column from being overfitted during training.
+            dag_edges: Optional iterable of DAG edges in ``(parent, child)`` format. If provided,
+                attention logits are augmented with learnable DAG bias terms.
+            dag_alpha_init: Initial value for learnable scalar ``alpha`` (parent bias).
+            dag_beta_init: Initial value for learnable scalar ``beta`` (ancestor bias).
+            dag_gamma_init: Initial value for learnable scalar ``gamma`` (unrelated penalty, applied as ``-gamma``).
+            dag_bias_learnable: Set ``True`` to learn alpha/beta/gamma, ``False`` to keep fixed.
 
         Returns:
             GReaTTrainer used for the fine-tuning process
@@ -308,6 +380,15 @@ class GReaT:
         df = _array_to_dataframe(data, columns=column_names)
         self._update_column_information(df)
         self._update_conditional_information(df, conditional_col)
+
+        if dag_edges is not None:
+            self._enable_dag_attention_bias(
+                dag_edges=dag_edges,
+                alpha_init=dag_alpha_init,
+                beta_init=dag_beta_init,
+                gamma_init=dag_gamma_init,
+                learnable=dag_bias_learnable,
+            )
 
         # Convert DataFrame into HuggingFace dataset object
         logging.info("Convert data into HuggingFace dataset object...")
@@ -495,6 +576,9 @@ class GReaT:
                     if random_feature_order:
                         random.shuffle(feature_names)
 
+                    feature_names = ["race", "age",  "native-country", "sex", "education", "hours-per-week", "workclass", "marital-status", "occupation", "relationship", "income"]
+                    # feature_names = ["asia", "tub", "smoke", "lung", "bronc", "either", "xray", "dysp"] # asia
+                    # feature_names = ["A", "C", "H", "D", "I", "O", "T"] # healthcare
                     # Start with empty sample
                     sample_text = ""
                     sample_values = {}
@@ -942,6 +1026,14 @@ class GReaT:
             # Save only the LoRA adapter weights (much smaller than full model)
             self.model.save_pretrained(path + "/lora_adapter")
             logging.info(f"LoRA adapter saved to {path}/lora_adapter")
+
+            dag_bias_module = getattr(self.model, "dag_attention_bias", None)
+            if dag_bias_module is not None:
+                torch.save(
+                    dag_bias_module.state_dict(),
+                    fs.open(path + "/dag_attention_bias.pt", "wb"),
+                )
+                logging.info(f"DAG attention bias state saved to {path}/dag_attention_bias.pt")
         else:
             torch.save(self.model.state_dict(), fs.open(path + "/model.pt", "wb"))
 
@@ -1010,11 +1102,32 @@ class GReaT:
         if isinstance(great.device, str):
             great.device = torch.device(great.device)
 
+        # Backward-compatible defaults for older checkpoints
+        if not hasattr(great, "dag_attention_enabled"):
+            great.dag_attention_enabled = False
+        if not hasattr(great, "dag_edges"):
+            great.dag_edges = None
+        if not hasattr(great, "dag_alpha_init"):
+            great.dag_alpha_init = 0.0
+        if not hasattr(great, "dag_beta_init"):
+            great.dag_beta_init = 0.0
+        if not hasattr(great, "dag_gamma_init"):
+            great.dag_gamma_init = 0.0
+        if not hasattr(great, "dag_bias_learnable"):
+            great.dag_bias_learnable = True
+        if not hasattr(great, "dag_attention_num_layers"):
+            great.dag_attention_num_layers = 0
+
         # Load model weights — LoRA adapter or full checkpoint
         lora_adapter_path = path + "/lora_adapter"
         has_lora_adapter = (
             fs.exists(lora_adapter_path)
             and fs.exists(lora_adapter_path + "/adapter_config.json")
+        )
+        has_dag_cfg = (
+            bool(great.dag_attention_enabled)
+            and great.dag_edges is not None
+            and great.columns is not None
         )
 
         if has_lora_adapter:
@@ -1029,7 +1142,30 @@ class GReaT:
                 great.model, lora_adapter_path, map_location="cpu"
             )
             logging.info(f"LoRA adapter loaded from {lora_adapter_path}")
+
+            if has_dag_cfg:
+                great._enable_dag_attention_bias(
+                    dag_edges=great.dag_edges,
+                    alpha_init=great.dag_alpha_init,
+                    beta_init=great.dag_beta_init,
+                    gamma_init=great.dag_gamma_init,
+                    learnable=great.dag_bias_learnable,
+                )
+                dag_state_path = path + "/dag_attention_bias.pt"
+                if fs.exists(dag_state_path):
+                    dag_state = torch.load(fs.open(dag_state_path, "rb"), map_location="cpu")
+                    great.model.dag_attention_bias.load_state_dict(dag_state)
+                    logging.info(f"DAG attention bias state loaded from {dag_state_path}")
         else:
+            if has_dag_cfg:
+                # Must attach modules before loading the full state dict (contains DAG params).
+                great._enable_dag_attention_bias(
+                    dag_edges=great.dag_edges,
+                    alpha_init=great.dag_alpha_init,
+                    beta_init=great.dag_beta_init,
+                    gamma_init=great.dag_gamma_init,
+                    learnable=great.dag_bias_learnable,
+                )
             great.model.load_state_dict(
                 torch.load(fs.open(path + "/model.pt", "rb"), map_location="cpu")
             )
